@@ -2,8 +2,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import sqlite3
 
-# This class creates the main application for the database viewer and editor.
-# The user can open a .db file, view its tables, and edit data directly in the table view.
 class DBViewerApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -248,4 +246,5 @@ class DBViewerApp(tk.Tk):
 if __name__ == "__main__":
     app = DBViewerApp()
     app.mainloop()
+
 
