@@ -62,7 +62,7 @@ class DBViewerApp(QMainWindow):
         try:
             self.conn = sqlite3.connect(file_path)
             self.cursor = self.conn.cursor()
-            self.setWindowTitle(f"Просмотрщик и редактор SQLite DB - {file_path}")
+            self.setWindowTitle(f"OBW - {file_path}")
             self.load_tables_list()
         except sqlite3.Error as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл базы данных:\n{e}")
