@@ -1,185 +1,294 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import sqlite3
+import os
+import sys
+import json
+import time
+import threading
+import logging
+from ftplib import FTP, error_perm
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLineEdit, QLabel, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QFileDialog, QProgressBar, QPlainTextEdit, QGroupBox, QGridLayout, QMessageBox, QDialog,
+    QDialogButtonBox, QFormLayout
+)
+from PyQt6.QtCore import Qt, QObject, pyqtSignal
 
-class DBViewerApp(tk.Tk):
+try:
+    from pyftpdlib.authorizers import DummyAuthorizer
+    from pyftpdlib.handlers import FTPHandler
+    from pyftpdlib.servers import FTPServer
+    PYFTPDLIB_AVAILABLE = True
+except Exception:
+    PYFTPDLIB_AVAILABLE = False
+
+
+class Worker(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+
+    def __init__(self, fn, *args):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+
+    def start(self):
+        def run():
+            try:
+                result = self.fn(*self.args, self)
+                self.finished.emit(result)
+            except Exception as e:
+                self.error.emit(str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+
+class AddUserDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add User")
+        self.username = QLineEdit()
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.homedir = QLineEdit()
+        self.perm = QLineEdit("elradfmw")
+        form = QFormLayout()
+        form.addRow("Username:", self.username)
+        form.addRow("Password:", self.password)
+        form.addRow("Home dir:", self.homedir)
+        form.addRow("Permissions:", self.perm)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(btns)
+        self.setLayout(layout)
+
+    def get_data(self):
+        return dict(
+            username=self.username.text(),
+            password=self.password.text(),
+            homedir=self.homedir.text(),
+            perm=self.perm.text()
+        )
+
+
+class OpenZilla(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("OBW - OpenBaseWriter")
-        self.geometry("1000x700")
+        self.setWindowTitle("OpenBaseWriter")
+        self.resize(1000, 700)
 
-        self.conn = None
-        self.cursor = None
-        self.current_table_name = ""
+        self.ftp = None
+        self.server = None
+        self.server_thread = None
+        self.local_path = os.getcwd()
 
-        self.create_widgets()
-        
-        self.editor = None
-        self.editing_item = None
-        self.editing_column = None
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        self.client_tab = QWidget()
+        self.server_tab = QWidget()
+        self.tabs.addTab(self.client_tab, "Client")
+        self.tabs.addTab(self.server_tab, "Server")
 
-    def create_widgets(self):
-        control_frame = ttk.Frame(self)
-        control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+        self.setup_client()
+        self.setup_server()
 
-        open_button = ttk.Button(control_frame, text="Открыть файл .db", command=self.open_db_file)
-        open_button.pack(side=tk.LEFT, padx=(0, 10))
+    def setup_client(self):
+        layout = QVBoxLayout()
+        top = QHBoxLayout()
+        self.host = QLineEdit(); self.host.setPlaceholderText("Host")
+        self.user = QLineEdit(); self.user.setPlaceholderText("User")
+        self.pwd = QLineEdit(); self.pwd.setEchoMode(QLineEdit.EchoMode.Password); self.pwd.setPlaceholderText("Password")
+        self.port = QLineEdit("21")
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self.toggle_connect)
+        for w in [self.host, self.user, self.pwd, self.port, self.connect_btn]:
+            top.addWidget(w)
+        layout.addLayout(top)
 
-        self.table_selector = ttk.Combobox(control_frame, state="readonly")
-        self.table_selector.pack(side=tk.LEFT, padx=5)
-        self.table_selector.bind("<<ComboboxSelected>>", self.on_table_selected)
+        split = QHBoxLayout()
+        self.local_tree = QTreeWidget(); self.local_tree.setHeaderLabels(["Name", "Size"])
+        self.remote_tree = QTreeWidget(); self.remote_tree.setHeaderLabels(["Name", "Size"])
+        split.addWidget(self.local_tree, 1)
+        split.addWidget(self.remote_tree, 1)
+        layout.addLayout(split)
 
-        table_frame = ttk.Frame(self)
-        table_frame.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        buttons = QHBoxLayout()
+        self.download_btn = QPushButton("Download")
+        self.upload_btn = QPushButton("Upload")
+        self.download_btn.clicked.connect(self.download)
+        self.upload_btn.clicked.connect(self.upload)
+        self.download_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
+        buttons.addWidget(self.download_btn)
+        buttons.addWidget(self.upload_btn)
+        layout.addLayout(buttons)
 
-        vsb = ttk.Scrollbar(table_frame, orient="vertical")
-        vsb.pack(side="right", fill="y")
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
 
-        hsb = ttk.Scrollbar(table_frame, orient="horizontal")
-        hsb.pack(side="bottom", fill="x")
+        self.client_log = QPlainTextEdit(); self.client_log.setReadOnly(True)
+        layout.addWidget(self.client_log, 1)
 
-        self.tree = ttk.Treeview(
-            table_frame, 
-            columns=(), 
-            show="headings",
-            yscrollcommand=vsb.set,
-            xscrollcommand=hsb.set
-        )
-        self.tree.pack(expand=True, fill=tk.BOTH)
+        self.client_tab.setLayout(layout)
+        self.refresh_local()
 
-        vsb.config(command=self.tree.yview)
-        hsb.config(command=self.tree.xview)
+    def setup_server(self):
+        layout = QVBoxLayout()
+        top = QHBoxLayout()
+        self.s_ip = QLineEdit("0.0.0.0")
+        self.s_port = QLineEdit("2121")
+        self.start_btn = QPushButton("Start Server")
+        self.stop_btn = QPushButton("Stop Server")
+        self.start_btn.clicked.connect(self.start_server)
+        self.stop_btn.clicked.connect(self.stop_server)
+        self.stop_btn.setEnabled(False)
+        for w in [QLabel("IP:"), self.s_ip, QLabel("Port:"), self.s_port, self.start_btn, self.stop_btn]:
+            top.addWidget(w)
+        layout.addLayout(top)
 
-        self.tree.bind("<Double-1>", self.on_double_click)
+        self.users = QTreeWidget(); self.users.setHeaderLabels(["Username", "Home", "Perm"])
+        layout.addWidget(self.users, 1)
+        user_btns = QHBoxLayout()
+        add = QPushButton("Add User"); add.clicked.connect(self.add_user)
+        rm = QPushButton("Remove User"); rm.clicked.connect(self.remove_user)
+        save = QPushButton("Save JSON"); save.clicked.connect(self.save_users)
+        load = QPushButton("Load JSON"); load.clicked.connect(self.load_users)
+        for w in [add, rm, save, load]: user_btns.addWidget(w)
+        layout.addLayout(user_btns)
 
-    def open_db_file(self):
-        file_path = filedialog.askopenfilename(
-            title="Выберите файл базы данных",
-            filetypes=[("Database files", "*.db"), ("All files", "*.*")]
-        )
+        self.server_log = QPlainTextEdit(); self.server_log.setReadOnly(True)
+        layout.addWidget(self.server_log, 1)
 
-        if not file_path:
+        self.server_tab.setLayout(layout)
+
+    def log_client(self, msg): self.client_log.appendPlainText(msg)
+    def log_server(self, msg): self.server_log.appendPlainText(msg)
+
+    def refresh_local(self):
+        self.local_tree.clear()
+        for f in os.listdir(self.local_path):
+            path = os.path.join(self.local_path, f)
+            size = str(os.path.getsize(path)) if os.path.isfile(path) else "<DIR>"
+            self.local_tree.addTopLevelItem(QTreeWidgetItem([f, size]))
+
+    def toggle_connect(self):
+        if self.ftp:
+            self.ftp.quit()
+            self.ftp = None
+            self.connect_btn.setText("Connect")
+            self.download_btn.setEnabled(False)
+            self.upload_btn.setEnabled(False)
+            self.log_client("Disconnected.")
+        else:
+            try:
+                self.ftp = FTP()
+                self.ftp.connect(self.host.text(), int(self.port.text()))
+                self.ftp.login(self.user.text(), self.pwd.text())
+                self.connect_btn.setText("Disconnect")
+                self.download_btn.setEnabled(True)
+                self.upload_btn.setEnabled(True)
+                self.log_client("Connected.")
+                self.refresh_remote()
+            except Exception as e:
+                self.log_client(f"Error: {e}")
+                self.ftp = None
+
+    def refresh_remote(self):
+        self.remote_tree.clear()
+        try:
+            for name in self.ftp.nlst():
+                try:
+                    size = self.ftp.size(name) or 0
+                except Exception:
+                    size = "<DIR>"
+                self.remote_tree.addTopLevelItem(QTreeWidgetItem([name, str(size)]))
+        except Exception as e:
+            self.log_client(f"Remote list error: {e}")
+
+    def upload(self):
+        item = self.local_tree.currentItem()
+        if not item: return
+        name = item.text(0)
+        path = os.path.join(self.local_path, name)
+        with open(path, "rb") as f:
+            self.ftp.storbinary(f"STOR {name}", f)
+        self.log_client(f"Uploaded {name}")
+        self.refresh_remote()
+
+    def download(self):
+        item = self.remote_tree.currentItem()
+        if not item: return
+        name = item.text(0)
+        with open(os.path.join(self.local_path, name), "wb") as f:
+            self.ftp.retrbinary(f"RETR {name}", f.write)
+        self.log_client(f"Downloaded {name}")
+        self.refresh_local()
+
+    def add_user(self):
+        dlg = AddUserDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            data = dlg.get_data()
+            self.users.addTopLevelItem(QTreeWidgetItem([data["username"], data["homedir"], data["perm"]]))
+            self.users.topLevelItem(self.users.topLevelItemCount()-1).setData(0, Qt.ItemDataRole.UserRole, data["password"])
+
+    def remove_user(self):
+        item = self.users.currentItem()
+        if item: self.users.takeTopLevelItem(self.users.indexOfTopLevelItem(item))
+
+    def save_users(self):
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Users", filter="JSON Files (*.json)")
+        if not fname: return
+        data = []
+        for i in range(self.users.topLevelItemCount()):
+            it = self.users.topLevelItem(i)
+            data.append(dict(
+                username=it.text(0),
+                password=it.data(0, Qt.ItemDataRole.UserRole),
+                homedir=it.text(1),
+                perm=it.text(2)
+            ))
+        with open(fname, "w") as f: json.dump(data, f, indent=2)
+        self.log_server(f"Saved {len(data)} users.")
+
+    def load_users(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Load Users", filter="JSON Files (*.json)")
+        if not fname: return
+        with open(fname) as f: data = json.load(f)
+        self.users.clear()
+        for u in data:
+            it = QTreeWidgetItem([u["username"], u["homedir"], u["perm"]])
+            it.setData(0, Qt.ItemDataRole.UserRole, u["password"])
+            self.users.addTopLevelItem(it)
+        self.log_server(f"Loaded {len(data)} users.")
+
+    def start_server(self):
+        if not PYFTPDLIB_AVAILABLE:
+            QMessageBox.critical(self, "Error", "pyftpdlib not installed")
             return
+        authorizer = DummyAuthorizer()
+        for i in range(self.users.topLevelItemCount()):
+            it = self.users.topLevelItem(i)
+            authorizer.add_user(it.text(0), it.data(0, Qt.ItemDataRole.UserRole), it.text(1), perm=it.text(2))
+        handler = FTPHandler; handler.authorizer = authorizer
+        self.server = FTPServer((self.s_ip.text(), int(self.s_port.text())), handler)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.log_server("Server started.")
+        self.start_btn.setEnabled(False); self.stop_btn.setEnabled(True)
 
-        if self.conn:
-            self.conn.close()
+    def stop_server(self):
+        if self.server:
+            self.server.close_all()
+            self.server = None
+            self.log_server("Server stopped.")
+            self.start_btn.setEnabled(True); self.stop_btn.setEnabled(False)
 
-        try:
-            self.conn = sqlite3.connect(file_path)
-            self.cursor = self.conn.cursor()
-            self.title(f"Просмотрщик и редактор SQLite DB - {file_path}")
-            
-            self.load_tables_list()
-
-        except sqlite3.Error as e:
-            messagebox.showerror("Ошибка", f"Не удалось открыть файл базы данных: {e}")
-            self.conn = None
-            self.cursor = None
-            self.table_selector['values'] = []
-            self.tree.delete(*self.tree.get_children())
-            self.tree["columns"] = []
-
-    def load_tables_list(self):
-        try:
-            self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = self.cursor.fetchall()
-            table_names = [table[0] for table in tables]
-            
-            self.table_selector['values'] = table_names
-            if table_names:
-                self.table_selector.current(0)
-                self.on_table_selected(None)
-
-        except sqlite3.Error as e:
-            messagebox.showerror("Ошибка", f"Не удалось загрузить список таблиц: {e}")
-
-    def on_table_selected(self, event):
-        self.current_table_name = self.table_selector.get()
-        if self.current_table_name:
-            self.load_table_data(self.current_table_name)
-
-    def load_table_data(self, table_name):
-        self.tree.delete(*self.tree.get_children())
-        self.tree["columns"] = ()
-
-        try:
-            self.cursor.execute(f"PRAGMA table_info('{table_name}');")
-            columns = self.cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            self.tree["columns"] = column_names
-            
-            for col_name in column_names:
-                self.tree.heading(col_name, text=col_name)
-                self.tree.column(col_name, width=100, stretch=tk.YES)
-
-            self.cursor.execute(f"SELECT * FROM '{table_name}';")
-            rows = self.cursor.fetchall()
-            
-            for row in rows:
-                self.tree.insert("", "end", values=row, iid=row[0])
-        
-        except sqlite3.Error as e:
-            messagebox.showerror("Ошибка", f"Не удалось загрузить данные из таблицы '{table_name}': {e}")
-            self.tree.delete(*self.tree.get_children())
-            self.tree["columns"] = []
-
-    def on_double_click(self, event):
-        region = self.tree.identify_region(event.x, event.y)
-        if region != "cell":
-            return
-        
-        self.editing_item = self.tree.identify_row(event.y)
-        self.editing_column = self.tree.identify_column(event.x)
-        
-        col_index = int(self.editing_column.replace("#", "")) - 1
-        
-        x, y, width, height = self.tree.bbox(self.editing_item, self.editing_column)
-        
-        current_value = self.tree.set(self.editing_item, self.editing_column)
-
-        if self.editor:
-            self.editor.destroy()
-
-        self.editor = ttk.Entry(self.tree)
-        self.editor.place(x=x, y=y, width=width, height=height)
-        self.editor.insert(0, current_value)
-        self.editor.focus()
-        self.editor.select_range(0, 'end')
-
-        self.editor.bind("<Return>", self.on_editor_enter)
-        self.editor.bind("<Escape>", self.on_editor_escape)
-
-    def on_editor_enter(self, event):
-        new_value = self.editor.get()
-        
-        column_name = self.tree.heading(self.editing_column, "text")
-        
-        row_id = self.tree.item(self.editing_item, "values")[0]
-        
-        try:
-            pk_column = self.tree.heading("#1", "text")
-            query = f"UPDATE '{self.current_table_name}' SET {column_name} = ? WHERE {pk_column} = ?;"
-            self.cursor.execute(query, (new_value, row_id))
-            self.conn.commit()
-            
-            current_values = list(self.tree.item(self.editing_item, "values"))
-            col_index = int(self.editing_column.replace("#", "")) - 1
-            current_values[col_index] = new_value
-            self.tree.item(self.editing_item, values=current_values)
-
-        except sqlite3.Error as e:
-            messagebox.showerror("Ошибка сохранения", f"Не удалось обновить запись: {e}")
-            self.conn.rollback()
-
-        self.editor.destroy()
-        self.editor = None
-
-    def on_editor_escape(self, event):
-        self.editor.destroy()
-        self.editor = None
 
 if __name__ == "__main__":
-    app = DBViewerApp()
-    app.mainloop()
-
+    app = QApplication(sys.argv)
+    w = OpenZilla()
+    w.show()
+    sys.exit(app.exec())
