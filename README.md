@@ -1,2 +1,6 @@
 # OBW - OpenBaseWriter (aka. OpenZilla)
-Database (.db) viewer/editor.
+<p>Database (.db) viewer/editor.</p>
+
+----
+
+![screenshot](readme-files/screenshot.png)
